@@ -1,3 +1,9 @@
+"""
+Client.py: Interface between end application and Half Baked GFS
+- Read data.
+- Write data.
+- Delete and Restore data.
+"""
 import sys
 import random
 import time
@@ -13,30 +19,21 @@ class CacheMeta:
 
 class ClientService(rpyc.Service):
     def __init__(self, master_hostname, master_port, client_hostname, client_port):
-        # connect to master
-        self.master_url = (master_hostname, master_port)
-        self.url = (client_hostname, client_port)
-        self.cache_data = {} # Store : (file_name, chunk_num) - > CacheMeta(chunk_id, primary_url, replica_urls))
-        self.cache_timeout = 30
-        self.chunk_size = 64 * 1024 # 64 KB
+        self.master_url = (master_hostname, master_port)        # Hostname and port at which the master listens
+        self.url = (client_hostname, client_port)               # Hostname and port at which the client listens
+        self.cache_data = {}                                    # Store : (file_name, chunk_num) -> CacheMeta(chunk_id, primary_url, replica_urls)
+        self.cache_timeout = 30                                 # Timeout after which primary chunkserver information corresponding to a chunk gets expired
+        self.chunk_size = 64 * 1024                             # Size of chunks  
         random.seed(0)
-    
-    def exposed_delete(self, file_name):
-        # delete from cache time before calling master
-        to_delete = []
-        for filename, chunk_num in self.cache_data:
-            if filename == file_name:
-                to_delete.append((filename, chunk_num))
-        
-        for t in to_delete:
-            del self.cache_data[t]
 
-        # call delete on master which will replace file name with the deleted file name
-        return rpyc.connect(*self.master_url).root.delete(file_name)
-        
-    def exposed_restore(self, file_name):
-        return rpyc.connect(*self.master_url).root.restore(file_name)
 
+    """
+    exposed_create: 
+    RPC called by end application to create a file. 
+    Initiates RPC to master to create the file.
+
+    @param file_name : string
+    """
     def exposed_create(self, file_name):
         cnt = 0
         while True:
@@ -52,6 +49,16 @@ class ClientService(rpyc.Service):
                 return "failed to create file"
         return "success"
 
+    """
+    exposed_read:
+    Reads the given amount of data starting from offset, for the supplied file name.
+    Initiates RPC to master to fetch chunk id and replicas corresponding to file name and chunk number.
+    Then reads corresponding chunk from any randomly choosen replica supplied by the master.
+
+    @param file_name : string
+    @param offset : int
+    @param total_bytes_to_read : int
+    """
     def exposed_read(self, file_name, offset, total_bytes_to_read):
         chunk_num = offset // self.chunk_size    # chunk_num from where we need to check chunk_id
         chunk_offset = offset % self.chunk_size  # with in the chunk at chunk_num, offset.
@@ -107,10 +114,13 @@ class ClientService(rpyc.Service):
         return data
 
     """
-    write:
-    Writes the given data to the desired file. The client specifies the byte_offset,
-    which must be the last byte written so far in the file.
+    exposed_write:
+    Writes the given data to the desired file. 
     Splits writes that overlap chunks into multiple writes.
+
+    @param file_name : string
+    @param data : string
+    @param offset : int
     """
     def exposed_write(self, file_name, data, offset):
         # offset is the offset within file_name from which data is to be written
@@ -133,7 +143,6 @@ class ClientService(rpyc.Service):
             
             write_offset = self.write_chunk(file_name, curr_data, chunk_num)
             
-            # TODO Failure handling for write_chunk
             if not isinstance(write_offset, int) and write_offset == "all chunkservers down":
                 return write_offset
 
@@ -146,15 +155,26 @@ class ClientService(rpyc.Service):
 
             # decrement data_size as data_size_in_curr_chunk amount of data written in curr_chunk
             data_size -= data_size_in_curr_chunk
+
             # set chunk offset to 0 as new chunk will be created in next iteration
             last_chunk_offset = 0
         return res
     
+
+    """
+    write_chunk:
+    Initiates RPC call to one of the chunkservers holding the chunk to append the data to the chunk and 
+    on success, initiates RPC call to commit the data.
+
+    @param file_name : string
+    @param data : string
+    @param chunk_num : int
+    """
     def write_chunk(self, file_name, data, chunk_num):
-        # Check primary is present in cache, if present return from cache, (chunk_id, primary and replica urls)
-        # Send the data to first replica, which will send it to all the replicas
-        #   Try sending data to each replica, if in respose we gets not successful for any of the chunkserver then delete that chunkserver
-        # Need to relay the failure message from any of the replica to client so that client can remove the chunkserver and request new primary, replicas from master
+        # Check primary is present in cache, if present return from cache, (chunk_id, primary and replica urls).
+        # Send the data to first replica, which will send it to all the replicas.
+        # Try sending data to each replica, if in respose we gets not successful for any of the chunkserver then delete that chunkserver.
+        # Need to relay the failure message from any of the replica to client so that client can remove the chunkserver and request new primary, replicas from master.
 
         if (file_name, chunk_num) in self.cache_data and self.cache_data[(file_name, chunk_num)].primary_url:
             # Read from cache if present
@@ -163,7 +183,6 @@ class ClientService(rpyc.Service):
         else:
             # Get information on replicas from master and save in local cache
             res = rpyc.connect(*self.master_url).root.get_primary(file_name, chunk_num, False)
-            # TODO handling of errors from get_primary
             if res == "all chunkservers down":
                 return res
             self.cache_data[(file_name, chunk_num)] = CacheMeta(res[0], res[1], list(res[2]), time.time() + self.cache_timeout)
@@ -184,9 +203,6 @@ class ClientService(rpyc.Service):
             if append_res == 'success':
                 break
             
-            # if append_res == 'chunk full':
-            #     return 'requested chunk is full'
-
             hostname, port = append_res.split('_')[-2], int(append_res.split('_')[-1])
             failed_url = (hostname, port)
             # Removing failed chunkserver from master metadata, this failed_url 
@@ -205,8 +221,6 @@ class ClientService(rpyc.Service):
         while append_res and append_res == 'success':
             secondary_urls = replica_urls[:]
             secondary_urls.remove(primary_url)
-            print("secondary urls", secondary_urls)
-            print("replica urls", replica_urls)
             try:
                 commit_append_res = rpyc.connect(*primary_url).root.commit_append(chunk_id, self.url, secondary_urls, primary_url)
             except Exception as e:
@@ -242,9 +256,6 @@ class ClientService(rpyc.Service):
                     except:
                         append_res = 'chunkserver_failure_' + str(to_send_urls[0])
                     
-                    # if append_res == 'chunk full':
-                    #     return 'requested chunk is full'
-
                     if append_res != 'success':
                         hostname, port = append_res.split('_')[-2], int(append_res.split('_')[-1])
                         rpyc.connect(*self.master_url).root.remove_chunkserver(failed_url)
@@ -253,6 +264,34 @@ class ClientService(rpyc.Service):
                 break
         
         return commit_append_res
+
+    """
+    exposed_delete:
+    Initiate RPC call to master for moving supplied file to trash.
+
+    @param file_name : string
+    """
+    def exposed_delete(self, file_name):
+        # delete from cache time before calling master
+        to_delete = []
+        for filename, chunk_num in self.cache_data:
+            if filename == file_name:
+                to_delete.append((filename, chunk_num))
+        
+        for t in to_delete:
+            del self.cache_data[t]
+
+        # call delete on master which will replace file name with the deleted file name
+        return rpyc.connect(*self.master_url).root.delete(file_name)
+        
+    """
+    exposed_restore:
+    Initiates RPC call to master in order to restore file from trash before expiry of trash timeout.
+
+    @param file_name : string
+    """
+    def exposed_restore(self, file_name):
+        return rpyc.connect(*self.master_url).root.restore(file_name)
     
 if __name__ == "__main__":
     hostname = sys.argv[1]

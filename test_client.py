@@ -8,7 +8,7 @@ from pexpect import pxssh
 # chunkserver_1 for IP[1] port 3001
 # chunkserver_2 for IP[1] port 3002
 # chunkserver_3 for IP[2] port 3003
-IPS = ["10.17.51.250", "10.17.51.22", "10.17.10.18"]
+IPS = ["IP1", "IP2", "IP3"]
 
 class BasicTests():
 

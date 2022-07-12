@@ -1,3 +1,12 @@
+"""
+Chunkserver.py: Manages the storage of chunks in Half Baked GFS.
+- Handles read and write requests from client.
+- Periodic heartbeat exchange with master.
+    - Lease extension
+    - Detection of stale replicas.
+- Re-replication of existing chunks through version information.
+- Periodic checksum validation to detect corruption of data.
+"""
 import chunk
 import sys
 import time
@@ -6,31 +15,28 @@ import hashlib as hash
 import pickle
 import rpyc
 from rpyc.utils.server import ThreadedServer
-import threading 
+import threading
 import os
 
 class ChunkMeta:
     def __init__(self, file_name, version, lease_expiry_time = 0, checksum = None, offset = 0):
-        self.file_name = file_name
-        self.version = version
-        self.lease_expiry_time = lease_expiry_time
-        self.offset = offset
-        self.checksum = checksum
+        self.file_name = file_name                          # File in which the contents of the chunk is stored
+        self.lease_expiry_time = lease_expiry_time          # Time at which the lease of the chunkserver for the chunk would expire
+        self.offset = offset                                # Offset at which the next incoming data for the chunk is to be appended
+        self.checksum = checksum                            # Checksum for the contents of the chunk to detect corruption of data
 
 class ChunkServerService(rpyc.Service):
     def __init__(self, hostname: str, port: int, master_hostname: str, master_port: int, storage_dir: str):
-        # TODO What if master is alive but there is a network partition between master and chunkserver
-        self.master_url = (master_hostname, master_port)
-        self.chunks_metadata = {} # chunk_id -> ChunkMeta
-        self.chunk_size = 64
-        self.storage_dir = storage_dir
-        self.backup_dir = f'{storage_dir}/dump/'
-        self.heartbeat_interval = 30
-        self.checksum_check_interval = 120
-        self.url = (hostname, port)
-        self.to_commit = {} # (chunk_id, client_url) => {Data in string}
-        self.ack_commit = {} # (chunk_id, client_url) => {Data in string}
-        self.init_from_storage() # Initialize from storage
+        self.master_url = (master_hostname, master_port)    # IP and port address at which the master listens
+        self.chunks_metadata = {}                           # chunk_id => ChunkMeta
+        self.storage_dir = storage_dir                      # directory where chunks are to be stored locally
+        self.backup_dir = f'{storage_dir}/dump/'            # directory to maintain version and checksums of the chunks in persistent storage
+        self.heartbeat_interval = 30                        # interval at which periodic exchange of heartbeat messages with master takes place
+        self.checksum_check_interval = 120                  # interval at which periodic checksum validation takes place
+        self.url = (hostname, port)                         # IP and port address at which the chunkserver listens
+        self.to_commit = {}                                 # (chunk_id, client_url) => {Data in string}
+        self.ack_commit = {}                                # (chunk_id, client_url) => {Data in string}
+        self.init_from_storage()                            # initialize from storage at boot time
         random.seed(0)
 
         if not os.path.exists(self.backup_dir):
@@ -39,7 +45,7 @@ class ChunkServerService(rpyc.Service):
         chunk_list = self.get_chunks_to_version()
         while True:
             try:
-                stale_replicas = rpyc.connect(*self.master_url).root.sync_chunkserver(self.url, chunk_list) # stale_replicas = Chunk_ids
+                stale_replicas = rpyc.connect(*self.master_url).root.sync_chunkserver(self.url, chunk_list) # stale_replicas = list[chunk_ids]
                 break
             except Exception as e:
                 print('failed to connect to master, retrying in 10 sec', e)
@@ -53,11 +59,21 @@ class ChunkServerService(rpyc.Service):
         background_checksum_thread.start()
         print("chunkserver initialised and connected with master")
 
+    """
+    get_chunks_to_version:
+    Deriving list of chunk id's and version information for all chunks which are currently stored by chunkserver.    
+    """
     def get_chunks_to_version(self):
         return [ (chunk_id, self.chunks_metadata[chunk_id].version) for chunk_id in self.chunks_metadata ]
 
+    """
+    remove_chunks:
+    For removing chunks from local storage and its metadata from chunkserver.
+    
+    params:
+    @stale_replicas : List[int]
+    """
     def remove_chunks(self, stale_replicas):
-        print('stale replicas', stale_replicas)
         for chunk_id in stale_replicas:
             file_name = self.chunks_metadata[chunk_id].file_name + '_chunk_id_' + str(chunk_id)
             file_path = self.storage_dir + '/' + file_name
@@ -66,12 +82,20 @@ class ChunkServerService(rpyc.Service):
             del self.chunks_metadata[chunk_id]
         self.flush_to_storage()
 
+    """
+    init_from_storage:
+    Load metadata from backup directory if it exists.
+    """
     def init_from_storage(self):
         if os.path.exists(f'{self.backup_dir}dump.pickle'):
             self.chunks_metadata = None
             with open(f'{self.backup_dir}dump.pickle', 'rb') as f:
                 self.chunks_metadata = pickle.load(f)
 
+    """
+    flush_to_storage:
+    Push metadata to backup directory on each update in metadata.
+    """
     def flush_to_storage(self):
         with open(f'{self.backup_dir}dump.pickle', 'wb') as f:
             pickle.dump(self.chunks_metadata, f)
@@ -79,8 +103,13 @@ class ChunkServerService(rpyc.Service):
     def on_connect(self, conn):
         pass
 
+    """"
+    is_checksum_valid:
+    Check if the checksum for the chunk is valid to detect corruption of chunks.
+    
+    @param chunk_id : int
+    """
     def is_checksum_valid(self, chunk_id):
-        # print("stored checksum", self.chunks_metadata[chunk_id].checksum)
         file_name = self.chunks_metadata[chunk_id].file_name + '_chunk_id_' + str(chunk_id)
 
         res =  (os.path.exists(self.storage_dir+'/'+file_name)) and ((hash.md5(open(self.storage_dir+'/'+file_name, 'rb').read()).hexdigest() == self.chunks_metadata[chunk_id].checksum) or (self.chunks_metadata[chunk_id].checksum == None))
@@ -95,6 +124,10 @@ class ChunkServerService(rpyc.Service):
         self.flush_to_storage()
         return res
     
+    """
+    background_checksum_thread:
+    Periodically run background thread to validate the checksum of all the chunk files present on the server.
+    """
     def background_checksum_thread(self):
         while True:
             curr_chunks = list(self.chunks_metadata.keys())[:]
@@ -103,7 +136,11 @@ class ChunkServerService(rpyc.Service):
             # wait before checking for checksum again
             time.sleep(self.checksum_check_interval)
 
-    # Send heartbeat to master and remove stale replicas, if any
+    """
+    background_heartbeat_thread:
+    Send periodic heartbeat messages to master and 
+    remove stale replicas supplied by master in response to the heartbeat message.
+    """
     def background_heartbeat_thread(self):
         while True:
             chunk_list = self.get_chunks_to_version()
@@ -124,9 +161,19 @@ class ChunkServerService(rpyc.Service):
 
             time.sleep(self.heartbeat_interval)
 
+
+    """
+    exposed_replicate_chunk:
+    RPC called by master to ask chunkserver to replicate a chunk available on other server to own storage.
+    Gets the file contents from the server.
+    Creates a new file in local storage and stores the contents in it.
+
+    @param chunk_id : int
+    @param version : int
+    @param replicas : List[(string, int)]
+    """
     def exposed_replicate_chunk(self, chunk_id, version, replicas):
         # Random shuffle replicas and iterate over it to get data from one of those
-        print(f"replicate chunk data on chunkserver for chunk id {chunk_id}")
         replicas = list(replicas)
         random.shuffle(replicas)
         success = 0
@@ -161,7 +208,14 @@ class ChunkServerService(rpyc.Service):
 
         self.flush_to_storage()
         return "success"
+    
+    """
+    exposed_get_chunk_data:
+    RPC called by other chunkserver in order to re-replicate chunk onto itself.
 
+    @param chunk_id : int
+    @param version  : int
+    """
     def exposed_get_chunk_data(self, chunk_id, version):
         # Check for the version number - stale replica
         # Check for the checksum - invalid checksum
@@ -173,23 +227,35 @@ class ChunkServerService(rpyc.Service):
             return "invalid checksum"
         with open(self.storage_dir + '/' + file_name, 'r') as f:
             data = f.read()
-        # print('data to be sent', data)
         # supply version number as curr chunkserver may have more 
         return (curr_version, self.chunks_metadata[chunk_id].file_name, data)
         
-    # master will make rpc to the create function to tell the chunkserver to create the file on its storage
+    """
+    exposed_create:
+    RPC called by master to create metadata and file in local storage for a given chunk.
+    
+    @param file_name : string
+    @param chunk_id : int
+    """
     def exposed_create(self, file_name, chunk_id):
         # create a file in local storage and initialize metadata for the chunk
-        print(f"create chunk on chunkserver for {file_name} with {chunk_id}")
         chunk_filename = file_name + "_chunk_id_"+ str(chunk_id)
         with open(self.storage_dir + '/' + chunk_filename, 'w') as f:
             pass
         self.chunks_metadata[chunk_id] = ChunkMeta(file_name, 1)
         self.flush_to_storage()
         
-    # client will make rpc to append data to one of the replicas for the chunk which will then send to the next one
-    # and serially will reach all the replicas
-    # another chunkserver can also make rpc to append data to the next replica
+
+    """
+    exposed_append:
+    RPC called by client to append data in the chunk and 
+    forward append request to one of the remaining url in list of replicas.
+    
+    @param chunk_id : int
+    @param data : string
+    @param client_url : (string, int)
+    @param replicas : List[(string, int)]
+    """
     def exposed_append(self, chunk_id, data, client_url, replicas):
         # store the data in self.chunks_metadata[chunk_id].to_commit\
         # if chunk id not exists in the chunkserver, it might be removed by the chunkserver due to invalid checksum
@@ -203,7 +269,6 @@ class ChunkServerService(rpyc.Service):
         self.to_commit[(chunk_id, client_url)] = data
         
         # remove itself from the replicas list
-        # print("Replicas: ", list(replicas), type(list(replicas))," URL: ",self.url, type(self.url))
         replicas.remove(self.url)
         
         # make the same append call to random replica from the new replicas list if list size > 0
@@ -213,7 +278,6 @@ class ChunkServerService(rpyc.Service):
             while True:
                 try:
                     res = rpyc.connect(*replica).root.append(chunk_id, data, client_url, replicas)
-                    # print("append res:", res, self.url)
                     if res != "success":
                         del self.to_commit[(chunk_id, client_url)]
                         return res
@@ -226,7 +290,18 @@ class ChunkServerService(rpyc.Service):
                     time.sleep(10)
         return "success"
 
-    # client will make rpc to the primary chunkserver to apply latest mutations on itself as well as all the secondaries
+    
+
+    """
+    exposed_commit_append:
+    RPC called by client to commit the append performed on the chunk which 
+    enables the consistency of data among all chunkservers holding the chunk.
+
+    @param chunk_id : int
+    @param client_url : (string, int)
+    @param secondary_urls : List[(string, int)]
+    @param primary_url : (string, int)
+    """
     def exposed_commit_append(self, chunk_id, client_url, secondary_urls, primary_url):
         # in case of stale replica and corrupted replica
         secondary_urls = list(secondary_urls)
@@ -265,14 +340,12 @@ class ChunkServerService(rpyc.Service):
             while True:
                 try:
                     ack = rpyc.connect(*url).root.commit_secondary_append(chunk_id, client_url, self.chunks_metadata[chunk_id].offset)
-                    # print('commit append ack', ack)
                     if(ack != "success"):
                         # Secondary chunkserver is unable to commit
                         return "commit_failed_" + str(url[0]) + '_' + str(url[1])
                     acks.append(ack)
                     break
                 except Exception as e:
-                    print("commit append exception", e)
                     cnt = cnt + 1
                     if(cnt == 10):
                         # Unable to commit to secondary chunkserver even after retries
@@ -288,11 +361,29 @@ class ChunkServerService(rpyc.Service):
             # Retry if secondary replicas is unreachable at an interval of 10 sec, and atmost 10 retries            
             ack = rpyc.connect(*url).root.remove_commit_ack(chunk_id, client_url)
         self.flush_to_storage()
-        return commit_offset
+        return commit_offset 
 
+
+    """
+    exposed_remove_commit_ack:
+    RPC called by other chunkserver (primary for the corresponding chunk) to tell 
+    chunkservers to remove the cached acknowledgement to commit.
+
+    @param chunk_id : int
+    @param client_url : (string, int)
+    """
     def exposed_remove_commit_ack(self, chunk_id, client_url):
         del self.ack_commit[(chunk_id, client_url)]
     
+    """
+    exposed_commit_secondary_append:
+    RPC called by other chunkserver (primary for the corresponding chunk) to tell 
+    secondary chunkservers to commit the recently appended data to the chunk.
+    
+    @param chunk_id : int
+    @param client_url : (string, int)
+    @param offset : int
+    """
     def exposed_commit_secondary_append(self, chunk_id, client_url, offset):
         # Already ack, make commit apend idempotent
         if (chunk_id, client_url) in self.ack_commit:
@@ -312,13 +403,20 @@ class ChunkServerService(rpyc.Service):
         self.flush_to_storage()
         return "success"
 
-    # client will make rpc to any of the chunkserver holding the chunk 
+
+    """
+    exposed_read:
+    RPC called by client to read the contents of the chunk.
+
+    @param chunk_id : int
+    @param chunk_offset : int
+    @param amount_to_read : int
+    """
     def exposed_read(self, chunk_id, chunk_offset, amount_to_read):
         # Check for checksum (see if it is corrupted or not ?) and also send data.
         if chunk_id not in self.chunks_metadata:
             return "chunk not found"
         file_name = self.storage_dir + '/' + self.chunks_metadata[chunk_id].file_name + '_chunk_id_' + str(chunk_id)
-        # print(file_name)
         with open(file_name, 'r') as f:
             f.seek(chunk_offset)
             data = f.read(amount_to_read)
@@ -327,11 +425,24 @@ class ChunkServerService(rpyc.Service):
                 return "data corrupted"
             return data
 
+    """
+    exposed_increment_chunk_version:
+    RPC called by master on election of new primary for given chunk to increment its version number.
+
+    @param chunk_id : int
+    @param version : int
+    """
     def exposed_increment_chunk_version(self, chunk_id, version):
         self.chunks_metadata[chunk_id].version += 1
         self.flush_to_storage()
 
-    # master will make rpc to tell the chunkserver it is the new primary for given chunk
+    """
+    exposed_select_primary:
+    RPC called by master to elect chunkserver as the primary chunkserver for a given chunk.
+    
+    @param chunk_id : int
+    @param lease_expiry_time : int
+    """
     def exposed_select_primary(self, chunk_id, lease_expiry_time):
         self.chunks_metadata[chunk_id].lease_expiry_time = lease_expiry_time
         self.flush_to_storage()
@@ -342,5 +453,4 @@ if __name__ == "__main__":
     master_hostname = sys.argv[3]
     master_port = int(sys.argv[4])
     storage_dir = sys.argv[5]
-    print("check")
     ThreadedServer(ChunkServerService(hostname, port, master_hostname, master_port, storage_dir), hostname = hostname, port = port).start()

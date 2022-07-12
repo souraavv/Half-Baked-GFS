@@ -1,3 +1,12 @@
+"""
+master.py: Manages the entire control flow of the system
+- Maintains the metadata of files and the corresponding chunks
+- Ensures correct number of replicas for each chunk and 
+  initiates chunk re-replication in case if replica count goes below replication factor.
+- Periodic garbage collection for deleting metadata corresponding to chunks in trash whose restoration timeout has expired.
+- Detects whether the chunks held by the chunkservers are stale on receiving the heartbeat from the chunkserver.
+- Responsible for extending the lease of primary chunkserver corresponding to a given chunk.
+"""
 import sys
 import random
 import rpyc
@@ -9,41 +18,43 @@ import copy
 # class for storing file's metadata
 class FileMeta:
     def __init__(self, chunks):
-        self.chunks = chunks # list of  chunk_ids = [chunk_id1, ..., chunk_idn ... ]
-        self.deleted_time = 0 # set when file name set to TRASHFILE
+        self.chunks = chunks                    # list of  chunk_ids = [chunk_id1, ..., chunk_idn ... ]
+        self.deleted_time = 0                   # set when file name set to TRASHFILE
         
 # class for storing chunk's metadata
 class ChunkMeta:
     def __init__(self, file_name, primary = [None, 0], replicas = [], version = 0):
-        self.file_name = file_name
-        self.primary = primary #(primary_url, lease_expiry_time)
-        self.replicas = replicas
-        self.version = version
+        self.file_name = file_name              # name of the file to which the chunk belongs
+        self.primary = primary                  # (primary_url, lease_expiry_time)
+        self.replicas = replicas                # list of (hostname, port) of chunkservers holding replica
+        self.version = version                  # latest version numbe of the chunk
 
 class ChunkserverMeta:
     def __init__(self, chunk_list, heartbeat_time):
-        self.chunk_list = chunk_list # list of chunk_ids = [chunk_id1, ..., chunk_idn ... ]
-        self.heartbeat_time = heartbeat_time # time when last heartbeat is received
+        self.chunk_list = chunk_list            # list of chunk_ids = [chunk_id1, ..., chunk_idn ... ]
+        self.heartbeat_time = heartbeat_time    # time when last heartbeat is received
         
 class MasterService(rpyc.Service):
     def __init__(self):
-        self.files_metadata = {} # file_name -> FileMeta
-        self.chunks_metadata = {} # chunk_id -> ChunkMeta
-        self.chunkserver_url_to_meta = {} # chunkserver_url -> ChunkserverMeta
-        self.lease_expiration_timeout = 60
-        self.delete_timeout = 40
-        self.heartbeat_interval = 30
-        self.rereplicate_chunks_interval = 50
-        self.latest_chunk_id = 1000 
+        self.files_metadata = {}                # file_name -> FileMeta
+        self.chunks_metadata = {}               # chunk_id -> ChunkMeta
+        self.chunkserver_url_to_meta = {}       # chunkserver_url -> ChunkserverMeta
+        self.lease_expiration_timeout = 60      # lease expiry timeout
+        self.delete_timeout = 40                # trash timeout after which file get garbage collected by master
+        self.heartbeat_interval = 30            # timeout before which periodic heartbeats from chunkserver should be received by the master
+        self.rereplicate_chunks_interval = 50   # interval at which master periodically checks for the count of replicas corresponding to every 
+        self.latest_chunk_id = 1000             # start of chunk ids for the chunks which are created
+        self.replication_factor = 3             # number of servers on which each chunk is to be replicated
         self.start_background_threads()
-        self.replication_factor = 3
         random.seed(0)
         
-    # initialize the master data structures
     def on_connect(self, conn):
-        # print("Connected")
         pass
 
+    """
+    start_background_threads:
+    Initiates background threads for garbage collection, checking of heartbeats and rereplicating chunks.
+    """
     def start_background_threads(self):
         garbage_collect_thread = threading.Thread(target=self.garbage_collection, args=(), daemon=True)
         check_heartbeat_thread = threading.Thread(target=self.check_heartbeats, args=(), daemon=True)
@@ -52,6 +63,11 @@ class MasterService(rpyc.Service):
         check_heartbeat_thread.start()
         rereplicate_chunks_thread.start()
 
+    """
+    check_heartbeats:
+    Checks if any chunkserver is dead by verifying the time of the last heartbeat sent by the chunkserver.
+    If time exceeds the heartbeat expiration timeout, then the chunkserver metadata is removed from the master.
+    """
     def check_heartbeats(self):
         while True:
             chunkservers_dict = copy.deepcopy(self.chunkserver_url_to_meta)
@@ -59,10 +75,16 @@ class MasterService(rpyc.Service):
                 last_heartbeat_time = chunkserver_meta.heartbeat_time
                 heartbeat_expiration = last_heartbeat_time + self.heartbeat_interval + 10
                 if time.time() > heartbeat_expiration:
-                    print(f'heartbeat expired for chunkserver {url}')
                     self.exposed_remove_chunkserver(url)
             time.sleep(self.heartbeat_interval + 10)
     
+
+    """
+    exposed_remove_chunkserver:
+    Removing metadata corresponding to chunkserver, if it fails to respond to master request.
+
+    @param url : (string, int)
+    """
     def exposed_remove_chunkserver(self, url):
         print(f'remove chunkservers called for {url}')
         if url not in self.chunkserver_url_to_meta:
@@ -76,11 +98,11 @@ class MasterService(rpyc.Service):
             # if this url was present as replicas of some chunks
             if url in chunk_meta.replicas:
                 chunk_meta.replicas.remove(url)
-                # If this was the only replica of the chunk, remove its chunks_metadata information of chunk_id 
-                # if len(chunk_meta.replicas) == 0:
-                #     del self.chunks_metadata[chunk_id]
 
-    # Background thread - checking for the (number of replicas == replication factor) for each chunk
+    """
+    rereplicate_chunks:
+    For any chunk, if the number of chunkservers holding the chunk goes below the replication factor, it initiates the re-replication.
+    """
     def rereplicate_chunks(self):
         while True:
             for chunk_id, chunk_meta in self.chunks_metadata.items():
@@ -108,10 +130,14 @@ class MasterService(rpyc.Service):
                         print('no new chunkservers found for re-replication')
             time.sleep(self.rereplicate_chunks_interval)
     
-    # def replicate_single_chunk(self):
-    #     # TODO make replicate chunk function in chunkserver, this function will call it
-    #     pass
 
+    """
+    exposed_delete:
+    RPC called by client to move given file to trash, 
+    which can later be garbage collected by another thread or restored by client before expiry of deletion timeout.
+
+    @param file_name : string
+    """
     def exposed_delete(self, file_name):
         # if file which is requested to be deleted is not present on master, might be calling delete after delete
         # this call will be idempotent
@@ -124,6 +150,13 @@ class MasterService(rpyc.Service):
         del self.files_metadata[file_name]
         return "success"
 
+
+    """
+    exposed_restore:
+    RPC called by client to restore file from trash if it has not exceeded the deletion timeout.
+
+    @param file_name : string
+    """
     def exposed_restore(self, file_name):
         print(f'trying to restore {file_name}')
         trash_file_name = 'TRASHFILE_' + file_name
@@ -133,7 +166,12 @@ class MasterService(rpyc.Service):
         self.files_metadata[file_name].deleted_time = 0
         del self.files_metadata[trash_file_name]
         return "successfully restored"
-        
+    
+
+    """
+    garbage_collection:
+    Periodically checks for files whose deletion timeout has expired and deletes their corresponding metadata.
+    """
     def garbage_collection(self):
         # If prefix with TRASHFILE_Originalfilename the we need to remove it from the master metadata.
         # Need to remove from file_metadata the FileMeta of that file. But before that take "all the chunks" related to that file
@@ -165,7 +203,15 @@ class MasterService(rpyc.Service):
                     del self.files_metadata[filename]
             time.sleep(self.delete_timeout + 10)
 
-    # check stale replicas in the chunkserver on coming out of dead state
+    """
+    exposed_sync_chunkserver:
+    RPC called by chunkserver when it reboots, to get itself synced with state of the master.
+    Updates the chunk version in the metadata if the chunkserver has higher version.
+    Master send a list of stale replicas in response to the chunkserver, if any.
+    
+    @param url : (string, int)
+    @param chunk_list : List[(int, int)]
+    """
     def exposed_sync_chunkserver(self, url, chunk_list):
         # chunk_list is a list of tuples containing chunk_id and version
         chunk_list = list(chunk_list)
@@ -196,12 +242,20 @@ class MasterService(rpyc.Service):
                 chunkserver_meta.chunk_list.append(chunk_id)
         return stale_chunks
 
-    # Send by the chunkserver
+
+    """
+    exposed_heartbeat:
+    RPC called periodically by active chunkservers, before expiry of heartbeat time.
+    Extends the lease for all the chunks for which the calling chunkserver is primary.
+    Checks if the calling chunkserver holds any stale replicas and returns them in response to the caller.
+    
+    @param url : (string, int)
+    @param chunk_list : List[(int, int)]
+    """
     def exposed_heartbeat(self, url, chunk_list):
         print(f"heartbeat received from {url} at {time.time()}")
         stale_replicas = []
 
-        # print('chunk list heartbeat', chunk_list)
         for (chunk_id, version) in chunk_list:
             if chunk_id not in self.chunks_metadata:
                 # in case if the chunk is deleted, we remove its metadata from master
@@ -229,27 +283,15 @@ class MasterService(rpyc.Service):
                 
         self.chunkserver_url_to_meta[url].heartbeat_time = time.time()
 
-        """
-        # When master has mapping for the chunkserver url in list of replicas for a chunk_id, and chunkserver list doesn't have that chunk_id ??? -> Think of a case
-        # If master has some chunks containing chunkserver url as replicas and chunk_list not contains them
-        # Remove them from master chunk metadata and also remove if it's primary
-        chunkserver_chunk_id_list = [chunk_id for chunk_id, _ in chunk_list]
-        # List of chunk_ids which are only present on master and not on the chunkserver which has supplied with the chunk_list
-        remaining_chunks = [chunk_id for chunk_id in self.chunk_metadata  if chunk_id not in chunkserver_chunk_id_list]
-        
-        for chunk_id in remaining_chunks:
-
-            if url == self.chunks_metadata[chunk_id].primary[0]:
-                self.chunks_metadata[chunk_id].primary[1] = 0
-
-            if url in self.chunks_metadata[chunk_id].replicas:
-                self.chunks_metadata[chunk_id].replicas.remove(url)
-        """
         return stale_replicas
 
     """
-    Used by client to create a file and first chunk, is file not exists
-    And if file exists then this function will simply create a single chunk and add to the file
+    exposed_create:
+    RPC called by client to create a file and first chunk, is file not exists
+    And if file exists then this function will simply create a single chunk and add to the file.
+    Assigns chunkservers to the chunk and asks the chunkservers to create the file for the chunk.
+
+    @param file_name : string
     """
     def exposed_create(self, file_name):
         # select three random chunkservers to create file on
@@ -295,6 +337,13 @@ class MasterService(rpyc.Service):
         self.latest_chunk_id = self.latest_chunk_id + 1
         return "success"
 
+    """
+    exposed_read:
+    RPC called by client for reading chunk number corresponding to the supplied file name.
+
+    @param file_name : string
+    @param chunk_num : int
+    """
     def exposed_read(self, file_name, chunk_num):
         print(f'read requested for file {file_name}, chunk num {chunk_num}')
         if file_name not in self.files_metadata:
@@ -311,6 +360,13 @@ class MasterService(rpyc.Service):
             replicas = self.chunks_metadata[chunk_id].replicas
             return (chunk_id, replicas)
 
+    """
+    exposed_invalid_checksum
+    RPC called by chunkserver to inform master about corruption of data in chunk.
+    
+    @param chunk_id : int
+    @param chunkserver : (string, int)
+    """
     def exposed_invalid_checksum(self, chunk_id, chunkserver):
         if self.chunks_metadata[chunk_id].primary[0] == chunkserver:
             self.chunks_metadata[chunk_id].primary = [None, 0]
@@ -319,6 +375,14 @@ class MasterService(rpyc.Service):
         if chunk_id in self.chunkserver_url_to_meta[chunkserver].chunk_list:
             self.chunkserver_url_to_meta[chunkserver].chunk_list.remove(chunk_id)
 
+    """
+    exposed_get_primary:
+    RPC called by client to get current primary chunkserver information if already elected or force elect a new primary chunkserver.
+    
+    @param file_name : string
+    @param chunk_idx : int
+    @param force_primary : bool
+    """
     def exposed_get_primary(self, file_name, chunk_idx, force_primary = False):
         # get the chunk id corresponding to the chunk_idx of the file
         chunk_id = self.files_metadata[file_name].chunks[chunk_idx]
@@ -334,7 +398,8 @@ class MasterService(rpyc.Service):
             select_new_primary = True
         
         # Elect new primary
-        # if force_primary sent by client or lease is expired elect new primary or chunk has no current primary assigned
+        # if force_primary sent by client or
+        #  new primary or chunk has no current primary assigned
         if primary_url == None or force_primary or select_new_primary:
             # random shuffle the replicas list and try to make first reachable chunkserver as primary
             new_replicas = replicas
@@ -343,7 +408,7 @@ class MasterService(rpyc.Service):
             for url in new_replicas:
                 try:
                     # if we are able to connect to chunk server, tell it to increment the version number of the chunk
-                    #------------------- not increment chunk version here, should be done once the primary is assigned
+                    # not increment chunk version here, should be done once the primary is assigned
                     rpyc.connect(*url).root.increment_chunk_version(chunk_id, self.chunks_metadata[chunk_id].version + 1)
                     # if we are unable to increment the chunk version number we will remove that chunkserver from list of replicas
                     if not primary_elected:

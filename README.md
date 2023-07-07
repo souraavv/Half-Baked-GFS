@@ -347,7 +347,7 @@ cache at the client to avoid unnecessary requests to the master. Implemented the
 workflow of deleting the files and the periodically running thread at master for the
 garbage collection.
 
-Chintan Sheth implemented the workflow of the three-step writes. Initially tried to
+- Chintan Sheth implemented the workflow of the three-step writes. Initially tried to
 implement asynchronous workflow of the writes, but were not able to achieve the desired behaviour. Finally, came up with the synchronous workflow. Also contributed in developing scripts to perform benchmarking of reads and writes. The workflow
 was initially built using static lease extensions, and then the workflows were later
 enhanced with dynamic lease extensions in conjunction with heartbeats, resulting
